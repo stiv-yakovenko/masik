@@ -4,29 +4,22 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"image"
-	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
-	"gioui.org/layout"
 	"gioui.org/unit"
-	"gioui.org/widget"
-	"gioui.org/widget/material"
 	"mycharm/coloreditor"
 )
 
-const defaultLineHeightScale = 1.35
 const defaultTabWidthSpaces = 4
 
 const defaultEditorText = "Open a folder from the File menu and choose a file in the explorer."
 
 type userConfig struct {
-	LastProjectDir        string  `json:"lastProjectDir"`
-	EditorLineHeightScale float32 `json:"editorLineHeightScale"`
-	TabWidthSpaces        int     `json:"tabWidthSpaces"`
+	LastProjectDir string `json:"lastProjectDir"`
+	TabWidthSpaces int    `json:"tabWidthSpaces"`
 }
 
 type projectConfig struct {
@@ -34,35 +27,22 @@ type projectConfig struct {
 }
 
 type ideState struct {
-	appRoot               string
-	userConfigPath        string
-	legacyUserConfigPath  string
-	projectConfigPath     string
-	currentDir            string
-	selectedFile          string
-	editorLineHeightScale float32
-	tabWidthSpaces        int
-	statusMessage         string
-	statusError           bool
-	explorer              explorerState
-	workspace             workspaceState
-	preferences           preferencesDialogState
-}
-
-type explorerState struct {
-	list widget.List
-	root *explorerNode
-}
-
-type explorerNode struct {
-	Name     string
-	Path     string
-	IsDir    bool
-	Expanded bool
-	Loaded   bool
-	Depth    int
-	Children []*explorerNode
-	Row      widget.Clickable
+	appRoot              string
+	userConfigPath       string
+	legacyUserConfigPath string
+	fontsConfigPath      string
+	projectConfigPath    string
+	currentDir           string
+	selectedFile         string
+	openDocuments        []openDocumentState
+	activeDocument       int
+	tabWidthSpaces       int
+	appearance           appearanceSettings
+	statusMessage        string
+	statusError          bool
+	explorer             explorerState
+	workspace            workspaceState
+	preferences          preferencesDialogState
 }
 
 func newIDEState(appRoot string, editor *coloreditor.Editor) (*ideState, error) {
@@ -72,15 +52,17 @@ func newIDEState(appRoot string, editor *coloreditor.Editor) (*ideState, error) 
 	if err != nil {
 		return state, err
 	}
-	if cfg.EditorLineHeightScale > 0 {
-		state.editorLineHeightScale = cfg.EditorLineHeightScale
-	}
 	if cfg.TabWidthSpaces > 0 {
 		state.tabWidthSpaces = cfg.TabWidthSpaces
 	}
+	fonts, err := loadFontsConfig(state.fontsConfigPath)
+	if err != nil {
+		return state, err
+	}
+	state.appearance = fonts
 	state.applyEditorPreferences(editor)
 
-	currentDir := filepath.Clean(cfg.LastProjectDir)
+	currentDir := absoluteCleanPath(cfg.LastProjectDir)
 	if currentDir == "" {
 		currentDir = appRoot
 	}
@@ -95,16 +77,18 @@ func newIDEState(appRoot string, editor *coloreditor.Editor) (*ideState, error) 
 }
 
 func newDefaultIDEState(appRoot string, editor *coloreditor.Editor) *ideState {
-	appRoot = filepath.Clean(appRoot)
+	appRoot = absoluteCleanPath(appRoot)
 	state := &ideState{
-		appRoot:               appRoot,
-		userConfigPath:        defaultUserConfigPath(appRoot),
-		legacyUserConfigPath:  legacyUserConfigPath(appRoot),
-		currentDir:            appRoot,
-		editorLineHeightScale: defaultLineHeightScale,
-		tabWidthSpaces:        defaultTabWidthSpaces,
+		appRoot:              appRoot,
+		userConfigPath:       defaultUserConfigPath(appRoot),
+		legacyUserConfigPath: legacyUserConfigPath(appRoot),
+		fontsConfigPath:      defaultFontsConfigPath(appRoot),
+		currentDir:           appRoot,
+		activeDocument:       -1,
+		tabWidthSpaces:       defaultTabWidthSpaces,
+		appearance:           defaultAppearanceSettings(),
 	}
-	state.explorer.list.Axis = layout.Vertical
+	state.explorer = newExplorerState()
 	state.workspace = newWorkspaceState()
 	state.preferences = newPreferencesDialogState()
 	state.applyEditorPreferences(editor)
@@ -153,9 +137,8 @@ func loadUserConfig(path, legacyPath string) (userConfig, error) {
 			}
 		}
 		cfg := userConfig{
-			LastProjectDir:        "",
-			EditorLineHeightScale: defaultLineHeightScale,
-			TabWidthSpaces:        defaultTabWidthSpaces,
+			LastProjectDir: "",
+			TabWidthSpaces: defaultTabWidthSpaces,
 		}
 		if err := saveUserConfig(path, cfg); err != nil {
 			return userConfig{}, err
@@ -185,9 +168,6 @@ func readUserConfigFile(path string) (userConfig, error) {
 }
 
 func normalizeUserConfig(cfg userConfig) userConfig {
-	if cfg.EditorLineHeightScale <= 0 {
-		cfg.EditorLineHeightScale = defaultLineHeightScale
-	}
 	if cfg.TabWidthSpaces <= 0 {
 		cfg.TabWidthSpaces = defaultTabWidthSpaces
 	}
@@ -251,9 +231,8 @@ func saveProjectConfig(projectDir string, cfg projectConfig) error {
 
 func (s *ideState) saveUserSettings() error {
 	cfg := userConfig{
-		LastProjectDir:        filepath.Clean(s.currentDir),
-		EditorLineHeightScale: s.editorLineHeightScale,
-		TabWidthSpaces:        s.tabWidthSpaces,
+		LastProjectDir: filepath.Clean(s.currentDir),
+		TabWidthSpaces: s.tabWidthSpaces,
 	}
 	return saveUserConfig(s.userConfigPath, cfg)
 }
@@ -266,7 +245,7 @@ func (s *ideState) saveProjectSettings() error {
 }
 
 func (s *ideState) setCurrentDir(dir string, editor *coloreditor.Editor) error {
-	dir = filepath.Clean(dir)
+	dir = absoluteCleanPath(dir)
 	info, err := os.Stat(dir)
 	if err != nil {
 		return err
@@ -277,9 +256,7 @@ func (s *ideState) setCurrentDir(dir string, editor *coloreditor.Editor) error {
 
 	s.currentDir = dir
 	s.projectConfigPath = projectConfigPath(s.currentDir)
-	s.selectedFile = ""
-	s.applyEditorPreferences(editor)
-	editor.SetText(defaultEditorText)
+	s.resetOpenDocuments(editor)
 	if err := s.reloadExplorer(); err != nil {
 		return err
 	}
@@ -299,6 +276,14 @@ func (s *ideState) setCurrentDir(dir string, editor *coloreditor.Editor) error {
 }
 
 func (s *ideState) openFile(editor *coloreditor.Editor, path string) error {
+	s.syncActiveDocument(editor)
+	path = filepath.Clean(path)
+	if index := s.findOpenDocument(path); index >= 0 {
+		s.activateDocument(editor, index)
+		s.setStatus(fmt.Sprintf("Switched to %s", s.selectedFileLabel()), false)
+		return nil
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -307,8 +292,13 @@ func (s *ideState) openFile(editor *coloreditor.Editor, path string) error {
 		return fmt.Errorf("binary files are not supported in the editor yet")
 	}
 
-	editor.SetText(string(data))
-	s.selectedFile = filepath.Clean(path)
+	s.openDocuments = append(s.openDocuments, openDocumentState{
+		Path:    path,
+		Content: string(data),
+	})
+	s.activeDocument = len(s.openDocuments) - 1
+	editor.SetText(s.openDocuments[s.activeDocument].Content)
+	s.selectedFile = path
 	s.setStatus(fmt.Sprintf("Opened %s", s.selectedFileLabel()), false)
 	s.expandToPath(s.selectedFile)
 	if err := s.saveProjectSettings(); err != nil {
@@ -338,6 +328,90 @@ func (s *ideState) restoreProjectSettings(editor *coloreditor.Editor) error {
 
 func (s *ideState) applyEditorPreferences(editor *coloreditor.Editor) {
 	editor.TabWidth = s.tabWidthSpaces
+	editor.LineHeight = unit.Sp(s.appearance.EditorLineHeight)
+	editor.LineHeightScale = 1
+}
+
+func (s *ideState) resetOpenDocuments(editor *coloreditor.Editor) {
+	s.openDocuments = nil
+	s.activeDocument = -1
+	s.selectedFile = ""
+	s.applyEditorPreferences(editor)
+	editor.SetText(defaultEditorText)
+}
+
+func (s *ideState) syncActiveDocument(editor *coloreditor.Editor) {
+	if s.activeDocument < 0 || s.activeDocument >= len(s.openDocuments) {
+		s.selectedFile = ""
+		return
+	}
+	s.openDocuments[s.activeDocument].Content = editor.Text()
+	s.selectedFile = s.openDocuments[s.activeDocument].Path
+}
+
+func (s *ideState) findOpenDocument(path string) int {
+	path = filepath.Clean(path)
+	for i := range s.openDocuments {
+		if samePath(s.openDocuments[i].Path, path) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (s *ideState) activateDocument(editor *coloreditor.Editor, index int) {
+	if index < 0 || index >= len(s.openDocuments) {
+		return
+	}
+	if index == s.activeDocument {
+		s.selectedFile = s.openDocuments[index].Path
+		return
+	}
+	s.syncActiveDocument(editor)
+	s.activeDocument = index
+	editor.SetText(s.openDocuments[index].Content)
+	s.selectedFile = s.openDocuments[index].Path
+	s.expandToPath(s.selectedFile)
+	if err := s.saveProjectSettings(); err != nil {
+		s.setStatus(fmt.Sprintf("Document selected, but project config save failed: %v", err), true)
+	}
+}
+
+func (s *ideState) closeDocument(editor *coloreditor.Editor, index int) {
+	if index < 0 || index >= len(s.openDocuments) {
+		return
+	}
+
+	closedPath := s.openDocuments[index].Path
+	s.syncActiveDocument(editor)
+
+	s.openDocuments = append(s.openDocuments[:index], s.openDocuments[index+1:]...)
+
+	switch {
+	case len(s.openDocuments) == 0:
+		s.activeDocument = -1
+		s.selectedFile = ""
+		editor.SetText(defaultEditorText)
+	case index == s.activeDocument:
+		if index >= len(s.openDocuments) {
+			index = len(s.openDocuments) - 1
+		}
+		s.activeDocument = index
+		editor.SetText(s.openDocuments[s.activeDocument].Content)
+		s.selectedFile = s.openDocuments[s.activeDocument].Path
+		s.expandToPath(s.selectedFile)
+	case index < s.activeDocument:
+		s.activeDocument--
+		s.selectedFile = s.openDocuments[s.activeDocument].Path
+	default:
+		s.selectedFile = s.openDocuments[s.activeDocument].Path
+	}
+
+	if err := s.saveProjectSettings(); err != nil {
+		s.setStatus(fmt.Sprintf("Closed %s, but project config save failed: %v", s.relativePathLabel(closedPath), err), true)
+		return
+	}
+	s.setStatus(fmt.Sprintf("Closed %s", s.relativePathLabel(closedPath)), false)
 }
 
 func (s *ideState) setStatus(message string, isError bool) {
@@ -349,214 +423,29 @@ func (s *ideState) selectedFileLabel() string {
 	if s.selectedFile == "" {
 		return "No file selected"
 	}
-	rel, err := filepath.Rel(s.currentDir, s.selectedFile)
+	return s.relativePathLabel(s.selectedFile)
+}
+
+func (s *ideState) relativePathLabel(path string) string {
+	rel, err := filepath.Rel(s.currentDir, path)
 	if err == nil && !strings.HasPrefix(rel, "..") {
 		return rel
 	}
-	return s.selectedFile
+	return path
 }
 
-func (s *ideState) reloadExplorer() error {
-	root := &explorerNode{
-		Name:     folderDisplayName(s.currentDir),
-		Path:     s.currentDir,
-		IsDir:    true,
-		Expanded: true,
-		Loaded:   true,
-	}
-	children, err := readExplorerChildren(root.Path, 0)
-	if err != nil {
-		return err
-	}
-	root.Children = children
-	s.explorer.root = root
-	return nil
-}
-
-func (s *ideState) visibleExplorerNodes() []*explorerNode {
-	if s.explorer.root == nil {
-		return nil
-	}
-	nodes := make([]*explorerNode, 0, len(s.explorer.root.Children))
-	var walk func(items []*explorerNode)
-	walk = func(items []*explorerNode) {
-		for _, item := range items {
-			nodes = append(nodes, item)
-			if item.IsDir && item.Expanded {
-				walk(item.Children)
-			}
+func (s *ideState) documentTabLabel(path string) string {
+	base := filepath.Base(path)
+	duplicates := 0
+	for i := range s.openDocuments {
+		if filepath.Base(s.openDocuments[i].Path) == base {
+			duplicates++
 		}
 	}
-	walk(s.explorer.root.Children)
-	return nodes
-}
-
-func (s *ideState) handleExplorerClicks(gtx layout.Context, editor *coloreditor.Editor) {
-	for _, node := range s.visibleExplorerNodes() {
-		if !node.Row.Clicked(gtx) {
-			continue
-		}
-		if node.IsDir {
-			if !node.Loaded {
-				children, err := readExplorerChildren(node.Path, node.Depth)
-				if err != nil {
-					s.setStatus(fmt.Sprintf("Failed to read %s: %v", node.Path, err), true)
-					continue
-				}
-				node.Children = children
-				node.Loaded = true
-			}
-			node.Expanded = !node.Expanded
-			continue
-		}
-		if err := s.openFile(editor, node.Path); err != nil {
-			s.setStatus(fmt.Sprintf("Failed to open %s: %v", filepath.Base(node.Path), err), true)
-		}
+	if duplicates > 1 {
+		return s.relativePathLabel(path)
 	}
-}
-
-func readExplorerChildren(dir string, depth int) ([]*explorerNode, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	nodes := make([]*explorerNode, 0, len(entries))
-	for _, entry := range entries {
-		name := entry.Name()
-		fullPath := filepath.Join(dir, name)
-		nodes = append(nodes, &explorerNode{
-			Name:  name,
-			Path:  fullPath,
-			IsDir: entry.IsDir(),
-			Depth: depth + 1,
-		})
-	}
-	return nodes, nil
-}
-
-func (s *ideState) expandToPath(target string) {
-	if s.explorer.root == nil || target == "" {
-		return
-	}
-	rel, err := filepath.Rel(s.currentDir, target)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return
-	}
-	parts := strings.Split(rel, string(filepath.Separator))
-	if len(parts) <= 1 {
-		return
-	}
-
-	node := s.explorer.root
-	for _, part := range parts[:len(parts)-1] {
-		var match *explorerNode
-		for _, child := range node.Children {
-			if child.IsDir && child.Name == part {
-				match = child
-				break
-			}
-		}
-		if match == nil {
-			return
-		}
-		if !match.Loaded {
-			children, err := readExplorerChildren(match.Path, match.Depth)
-			if err != nil {
-				return
-			}
-			match.Children = children
-			match.Loaded = true
-		}
-		match.Expanded = true
-		node = match
-	}
-}
-
-func layoutExplorerPanel(gtx layout.Context, th *material.Theme, state *ideState) layout.Dimensions {
-	panelWidth := gtx.Dp(unit.Dp(280))
-	gtx.Constraints.Min.X = panelWidth
-	gtx.Constraints.Max.X = panelWidth
-
-	return widget.Border{
-		Color:        color.NRGBA{R: 0xD0, G: 0xD7, B: 0xDE, A: 0xFF},
-		CornerRadius: unit.Dp(10),
-		Width:        unit.Dp(1),
-	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		fill(gtx, color.NRGBA{R: 0xFB, G: 0xF8, B: 0xF2, A: 0xFF})
-		return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					label := material.Body2(th, "Explorer")
-					label.Color = color.NRGBA{R: 0x5A, G: 0x63, B: 0x68, A: 0xFF}
-					return label.Layout(gtx)
-				}),
-				layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
-				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-					nodes := state.visibleExplorerNodes()
-					list := material.List(th, &state.explorer.list)
-					return list.Layout(gtx, len(nodes), func(gtx layout.Context, index int) layout.Dimensions {
-						return layoutExplorerRow(gtx, th, state, nodes[index])
-					})
-				}),
-			)
-		})
-	})
-}
-
-func layoutExplorerRow(gtx layout.Context, th *material.Theme, state *ideState, node *explorerNode) layout.Dimensions {
-	return node.Row.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		height := gtx.Dp(unit.Dp(30))
-		gtx.Constraints.Min.Y = height
-		gtx.Constraints.Max.Y = height
-
-		isSelected := !node.IsDir && filepath.Clean(node.Path) == state.selectedFile
-		background := color.NRGBA{A: 0}
-		border := color.NRGBA{A: 0}
-		if isSelected {
-			background = color.NRGBA{R: 0xE3, G: 0xEC, B: 0xF6, A: 0xFF}
-			border = color.NRGBA{R: 0xB7, G: 0xC9, B: 0xDB, A: 0xFF}
-		} else if node.Row.Hovered() {
-			background = color.NRGBA{R: 0xF0, G: 0xEA, B: 0xDE, A: 0xFF}
-			border = color.NRGBA{R: 0xE1, G: 0xD9, B: 0xCC, A: 0xFF}
-		}
-
-		return widget.Border{
-			Color:        border,
-			CornerRadius: unit.Dp(6),
-			Width:        unit.Dp(1),
-		}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			if background.A != 0 {
-				fillRect(gtx, image.Rect(0, 0, gtx.Constraints.Max.X, gtx.Constraints.Max.Y), background)
-			}
-
-			leftInset := unit.Dp(float32((node.Depth - 1) * 16))
-			return layout.Inset{
-				Top:    unit.Dp(5),
-				Bottom: unit.Dp(5),
-				Left:   leftInset + unit.Dp(10),
-				Right:  unit.Dp(10),
-			}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				label := material.Body2(th, explorerLabel(node))
-				if node.IsDir {
-					label.Color = color.NRGBA{R: 0x38, G: 0x42, B: 0x48, A: 0xFF}
-				} else {
-					label.Color = color.NRGBA{R: 0x52, G: 0x5B, B: 0x61, A: 0xFF}
-				}
-				return label.Layout(gtx)
-			})
-		})
-	})
-}
-
-func explorerLabel(node *explorerNode) string {
-	if !node.IsDir {
-		return node.Name
-	}
-	if node.Expanded {
-		return "[-] " + node.Name
-	}
-	return "[+] " + node.Name
+	return base
 }
 
 func resolveConfigPath(base, value string) string {
@@ -593,4 +482,15 @@ func isWithinRoot(root, target string) bool {
 
 func samePath(a, b string) bool {
 	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func absoluteCleanPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(path)
+	if err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(path)
 }

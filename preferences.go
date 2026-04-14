@@ -17,8 +17,7 @@ import (
 )
 
 type preferencesDraft struct {
-	EditorLineHeightScale float32
-	TabWidthSpaces        int
+	TabWidthSpaces int
 }
 
 type preferencesPageState struct {
@@ -97,8 +96,7 @@ func (s *ideState) openPreferences() {
 	s.preferences.positioned = false
 	s.preferences.search.SetText("")
 	s.preferences.draft = preferencesDraft{
-		EditorLineHeightScale: s.editorLineHeightScale,
-		TabWidthSpaces:        s.tabWidthSpaces,
+		TabWidthSpaces: s.tabWidthSpaces,
 	}
 }
 
@@ -119,17 +117,11 @@ func (s *ideState) handlePreferencesEvents(gtx layout.Context, editor *coloredit
 			s.preferences.draft.TabWidthSpaces = s.preferences.tabWidthOptions[i].Value
 		}
 	}
-	for i := range s.preferences.lineHeightOptions {
-		if s.preferences.lineHeightOptions[i].Button.Clicked(gtx) {
-			s.preferences.draft.EditorLineHeightScale = s.preferences.lineHeightOptions[i].Value
-		}
-	}
 	if s.preferences.cancelButton.Clicked(gtx) {
 		s.preferences.open = false
 		return
 	}
 	if s.preferences.okButton.Clicked(gtx) {
-		s.editorLineHeightScale = s.preferences.draft.EditorLineHeightScale
 		s.tabWidthSpaces = s.preferences.draft.TabWidthSpaces
 		s.applyEditorPreferences(editor)
 		if err := s.saveUserSettings(); err != nil {
@@ -448,12 +440,6 @@ func layoutPreferencesAppearancePage(gtx layout.Context, th *material.Theme, sta
 		layout.Rigid(material.H6(th, "Editor / Appearance").Layout),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 		layout.Rigid(material.Body2(th, "Global editor appearance settings for every project on this machine.").Layout),
-		layout.Rigid(layout.Spacer{Height: unit.Dp(18)}.Layout),
-		layout.Rigid(material.Body2(th, "Line spacing").Layout),
-		layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return layoutFloatPreferenceOptionRow(gtx, th, state.preferences.draft.EditorLineHeightScale, state.preferences.lineHeightOptions)
-		}),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(18)}.Layout),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			pathLabel := material.Caption(th, state.userConfigPath)

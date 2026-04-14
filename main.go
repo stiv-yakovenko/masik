@@ -68,6 +68,7 @@ func run(w *app.Window) error {
 
 	w.Option(app.Title("Gio Multiline Editor - " + state.currentDir))
 	folderPickResults := make(chan folderPickResult, 1)
+	terminalEvents := make(chan terminalProcessEvent, 8)
 
 	editor.SingleLine = false
 	editor.WrapPolicy = text.WrapWords
@@ -87,6 +88,10 @@ func run(w *app.Window) error {
 					log.Printf("change dir failed: %v", err)
 				}
 			}
+		case event := <-terminalEvents:
+			if _, repaint := state.workspace.terminal.applyProcessEvent(event); repaint {
+				w.Invalidate()
+			}
 		default:
 		}
 
@@ -99,15 +104,16 @@ func run(w *app.Window) error {
 
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
-			layoutUI(gtx, th, w, state, &editor, maximized, &fileMenuOpen, &browsingFolder, folderPickResults, &fileMenu, &editMenu, &viewMenu, &openFolderItem, &preferencesItem, &minBtn, &maxBtn, &closeBtn)
+			layoutUI(gtx, th, w, state, &editor, maximized, &fileMenuOpen, &browsingFolder, folderPickResults, terminalEvents, &fileMenu, &editMenu, &viewMenu, &openFolderItem, &preferencesItem, &minBtn, &maxBtn, &closeBtn)
 			e.Frame(gtx.Ops)
 		}
 	}
 }
 
-func layoutUI(gtx layout.Context, th *material.Theme, w *app.Window, state *ideState, editor *coloreditor.Editor, maximized bool, fileMenuOpen *bool, browsingFolder *bool, folderPickResults chan<- folderPickResult, fileMenu, editMenu, viewMenu, openFolderItem, preferencesItem, minBtn, maxBtn, closeBtn *widget.Clickable) layout.Dimensions {
+func layoutUI(gtx layout.Context, th *material.Theme, w *app.Window, state *ideState, editor *coloreditor.Editor, maximized bool, fileMenuOpen *bool, browsingFolder *bool, folderPickResults chan<- folderPickResult, terminalEvents chan<- terminalProcessEvent, fileMenu, editMenu, viewMenu, openFolderItem, preferencesItem, minBtn, maxBtn, closeBtn *widget.Clickable) layout.Dimensions {
 	state.handlePreferencesEvents(gtx, editor)
-	state.handleWorkspaceEvents(gtx)
+	state.handleCentralContentEvents(gtx, editor)
+	state.handleWorkspaceEvents(gtx, w, terminalEvents)
 	if !state.preferences.open {
 		state.handleExplorerClicks(gtx, editor)
 	}
@@ -158,10 +164,8 @@ func layoutUI(gtx layout.Context, th *material.Theme, w *app.Window, state *ideS
 					return layoutTitleMenuBar(gtx, th, maximized, state.currentDir, fileMenu, editMenu, viewMenu, minBtn, maxBtn, closeBtn)
 				}),
 				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-					return layout.UniformInset(unit.Dp(16)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-						return layoutWorkspace(gtx, th, state, func(gtx layout.Context) layout.Dimensions {
-								return layoutEditorPane(gtx, th, editor, state)
-						})
+					return layoutWorkspace(gtx, th, state, func(gtx layout.Context) layout.Dimensions {
+						return layoutCentralContent(gtx, th, editor, state)
 					})
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -395,43 +399,13 @@ func layoutWindowButton(gtx layout.Context, btn *widget.Clickable, kind windowBu
 	})
 }
 
-func layoutEditorPane(gtx layout.Context, th *material.Theme, editor *coloreditor.Editor, state *ideState) layout.Dimensions {
-	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			label := material.Body2(th, state.selectedFileLabel())
-			label.Color = color.NRGBA{R: 0x4A, G: 0x53, B: 0x58, A: 0xFF}
-			return label.Layout(gtx)
-		}),
-		layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			label := material.Body2(th, state.statusMessage)
-			if state.statusError {
-				label.Color = color.NRGBA{R: 0x96, G: 0x33, B: 0x33, A: 0xFF}
-			} else {
-				label.Color = color.NRGBA{R: 0x6A, G: 0x73, B: 0x78, A: 0xFF}
-			}
-			return label.Layout(gtx)
-		}),
-		layout.Rigid(layout.Spacer{Height: unit.Dp(14)}.Layout),
-		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			return layoutEditor(gtx, th, editor, state.editorLineHeightScale)
-		}),
-	)
-}
-
-func layoutEditor(gtx layout.Context, th *material.Theme, editor *coloreditor.Editor, lineHeightScale float32) layout.Dimensions {
-	return widget.Border{
-		Color:        color.NRGBA{R: 0x66, G: 0x7A, B: 0x8A, A: 0xFF},
-		CornerRadius: unit.Dp(10),
-		Width:        unit.Dp(1),
-	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		gtx.Constraints.Min = gtx.Constraints.Max
-
-		return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			field := coloreditor.NewStyle(th, editor, "Type here...")
-			field.LineHeightScale = lineHeightScale
-			return field.Layout(gtx)
-		})
+func layoutEditor(gtx layout.Context, th *material.Theme, editor *coloreditor.Editor, metrics textMetrics) layout.Dimensions {
+	gtx.Constraints.Min = gtx.Constraints.Max
+	return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		field := coloreditor.NewStyle(th, editor, "Type here...")
+		field.TextSize = unit.Sp(metrics.FontSize)
+		field.LineHeightScale = 1
+		return field.Layout(gtx)
 	})
 }
 
@@ -446,6 +420,15 @@ func visualLineColor(index int) color.NRGBA {
 		B: 0x60 + uint8((sum>>16)&0x5F),
 		A: 0xFF,
 	}
+}
+
+func layoutWithSideBorders(gtx layout.Context, bgColor, borderColor color.NRGBA, w layout.Widget) layout.Dimensions {
+	maxPt := gtx.Constraints.Max
+	paint.FillShape(gtx.Ops, bgColor, clip.Rect{Max: maxPt}.Op())
+	bw := gtx.Dp(unit.Dp(1))
+	fillRect(gtx, image.Rect(0, 0, bw, maxPt.Y), borderColor)
+	fillRect(gtx, image.Rect(maxPt.X-bw, 0, maxPt.X, maxPt.Y), borderColor)
+	return layout.Inset{Left: unit.Dp(1), Right: unit.Dp(1)}.Layout(gtx, w)
 }
 
 func fill(gtx layout.Context, c color.NRGBA) {

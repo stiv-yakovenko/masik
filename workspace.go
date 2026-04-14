@@ -7,6 +7,7 @@ import (
 	"math"
 	"strings"
 
+	"gioui.org/app"
 	"gioui.org/gesture"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
@@ -20,7 +21,9 @@ const (
 	activityBarWidthDp = 46
 	splitterWidthDp    = 6
 	minEditorWidthPx   = 220
+	minMainHeightPx    = 180
 	minSidePanelWidth  = 110
+	minTerminalHeight  = 120
 )
 
 type workspaceState struct {
@@ -39,6 +42,8 @@ type workspaceState struct {
 	chatInput    widget.Editor
 	chatSend     widget.Clickable
 	chatMessages []string
+
+	terminal terminalState
 }
 
 type paneSplitter struct {
@@ -47,6 +52,14 @@ type paneSplitter struct {
 	startSize     int
 	startPointerX float32
 	originX       float32
+}
+
+type verticalPaneSplitter struct {
+	drag          gesture.Drag
+	dragging      bool
+	startSize     int
+	startPointerY float32
+	originY       float32
 }
 
 func newWorkspaceState() workspaceState {
@@ -61,6 +74,7 @@ func newWorkspaceState() workspaceState {
 		chatWidth:       320,
 		chatList:        chatList,
 		chatInput:       chatInput,
+		terminal:        newTerminalState(),
 		chatMessages: []string{
 			"Chat panel is ready.",
 			"We can wire real assistant conversations into this panel next.",
@@ -68,12 +82,57 @@ func newWorkspaceState() workspaceState {
 	}
 }
 
-func (s *ideState) handleWorkspaceEvents(gtx layout.Context) {
+func (s *ideState) handleWorkspaceEvents(gtx layout.Context, w *app.Window, terminalEvents chan<- terminalProcessEvent) {
 	if s.workspace.explorerButton.Clicked(gtx) {
 		s.workspace.explorerVisible = !s.workspace.explorerVisible
 	}
 	if s.workspace.chatButton.Clicked(gtx) {
 		s.workspace.chatVisible = !s.workspace.chatVisible
+	}
+	if s.workspace.terminal.toggleButton.Clicked(gtx) {
+		if s.workspace.terminal.visible {
+			s.workspace.terminal.collapse()
+			s.setStatus("Terminal hidden.", false)
+		} else if err := s.workspace.terminal.show(s.currentDir, w, terminalEvents); err != nil {
+			s.setStatus("Failed to open terminal: "+err.Error(), true)
+		} else {
+			s.setStatus("Terminal opened.", false)
+		}
+	}
+	if s.workspace.terminal.visible && s.workspace.terminal.minimizeButton.Clicked(gtx) {
+		s.workspace.terminal.collapse()
+		s.setStatus("Terminal minimized.", false)
+	}
+	if s.workspace.terminal.visible && s.workspace.terminal.addButton.Clicked(gtx) {
+		label, err := s.workspace.terminal.openTab(s.currentDir, w, terminalEvents)
+		if err != nil {
+			s.setStatus("Failed to open terminal tab: "+err.Error(), true)
+		} else {
+			s.setStatus(label+" opened.", false)
+		}
+	}
+	if s.workspace.terminal.visible {
+		for i := range s.workspace.terminal.tabs {
+			if s.workspace.terminal.tabs[i].CloseButton.Clicked(gtx) {
+				closedTitle := s.workspace.terminal.tabs[i].Title
+				s.workspace.terminal.closeTab(i)
+				if len(s.workspace.terminal.tabs) == 0 {
+					s.setStatus("Terminal closed.", false)
+				} else {
+					s.setStatus(closedTitle+" closed.", false)
+				}
+				s.workspace.handleSplitters(gtx)
+				return
+			}
+		}
+		for i := range s.workspace.terminal.tabs {
+			if !s.workspace.terminal.tabs[i].TabButton.Clicked(gtx) || i == s.workspace.terminal.activeTab {
+				continue
+			}
+			s.workspace.terminal.activeTab = i
+			s.workspace.terminal.tabs[i].FocusNext = true
+			s.setStatus("Switched to "+s.workspace.terminal.tabs[i].Title, false)
+		}
 	}
 	if s.workspace.chatSend.Clicked(gtx) {
 		msg := strings.TrimSpace(s.workspace.chatInput.Text())
@@ -88,6 +147,7 @@ func (s *ideState) handleWorkspaceEvents(gtx layout.Context) {
 func (w *workspaceState) handleSplitters(gtx layout.Context) {
 	w.explorerSplitter.update(gtx, &w.explorerWidth, 1)
 	w.chatSplitter.update(gtx, &w.chatWidth, -1)
+	w.terminal.splitter.update(gtx, &w.terminal.height)
 }
 
 func (d *paneSplitter) update(gtx layout.Context, size *int, direction int) {
@@ -113,6 +173,29 @@ func (d *paneSplitter) update(gtx layout.Context, size *int, direction int) {
 	}
 }
 
+func (d *verticalPaneSplitter) update(gtx layout.Context, size *int) {
+	for {
+		ev, ok := d.drag.Update(gtx.Metric, gtx.Source, gesture.Vertical)
+		if !ok {
+			break
+		}
+		switch ev.Kind {
+		case pointer.Press:
+			d.dragging = true
+			d.startSize = *size
+			d.startPointerY = d.originY + ev.Position.Y
+		case pointer.Drag:
+			if d.dragging {
+				pointerY := d.originY + ev.Position.Y
+				delta := int(math.Round(float64(pointerY - d.startPointerY)))
+				*size = d.startSize - delta
+			}
+		case pointer.Release, pointer.Cancel:
+			d.dragging = false
+		}
+	}
+}
+
 func (w *workspaceState) normalize(totalWidth, splitterWidth, activityWidth int) {
 	splitterCount := 0
 	if w.explorerVisible {
@@ -122,7 +205,7 @@ func (w *workspaceState) normalize(totalWidth, splitterWidth, activityWidth int)
 		splitterCount++
 	}
 
-	available := totalWidth - activityWidth - splitterCount*splitterWidth - minEditorWidthPx
+	available := totalWidth - activityWidth*2 - splitterCount*splitterWidth - minEditorWidthPx
 	if available < 0 {
 		available = 0
 	}
@@ -167,66 +250,113 @@ func layoutWorkspace(gtx layout.Context, th *material.Theme, state *ideState, ed
 	activityWidth := gtx.Dp(unit.Dp(activityBarWidthDp))
 	splitterWidth := gtx.Dp(unit.Dp(splitterWidthDp))
 	state.workspace.normalize(gtx.Constraints.Max.X, splitterWidth, activityWidth)
+	state.workspace.terminal.normalize(gtx.Constraints.Max.Y, splitterWidth)
 	if state.workspace.explorerVisible {
 		state.workspace.explorerSplitter.originX = float32(activityWidth + state.workspace.explorerWidth)
 	}
 	if state.workspace.chatVisible {
-		state.workspace.chatSplitter.originX = float32(gtx.Constraints.Max.X - state.workspace.chatWidth - splitterWidth)
+		state.workspace.chatSplitter.originX = float32(gtx.Constraints.Max.X - activityWidth - state.workspace.chatWidth - splitterWidth)
+	}
+	if state.workspace.terminal.visible {
+		state.workspace.terminal.splitter.originY = float32(gtx.Constraints.Max.Y - state.workspace.terminal.height - splitterWidth)
 	}
 
-	children := []layout.FlexChild{
+	rowChildren := []layout.FlexChild{
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min.X = activityWidth
 			gtx.Constraints.Max.X = activityWidth
-			return layoutActivityBar(gtx, th, state)
+			return layoutActivityBar(gtx, th, []activityBarItem{
+				{Button: &state.workspace.explorerButton, Active: state.workspace.explorerVisible, Label: "E"},
+				{Button: &state.workspace.terminal.toggleButton, Active: state.workspace.terminal.visible, Label: "T"},
+			})
 		}),
 	}
 
 	if state.workspace.explorerVisible {
-		children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		rowChildren = append(rowChildren, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min.X = state.workspace.explorerWidth
 			gtx.Constraints.Max.X = state.workspace.explorerWidth
 			return layoutExplorerPanel(gtx, th, state)
 		}))
-		children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		rowChildren = append(rowChildren, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return layoutPaneSplitter(gtx, &state.workspace.explorerSplitter)
 		}))
 	}
 
-	children = append(children, layout.Flexed(1, editor))
+	rowChildren = append(rowChildren, layout.Flexed(1, editor))
 
 	if state.workspace.chatVisible {
-		children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		rowChildren = append(rowChildren, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return layoutPaneSplitter(gtx, &state.workspace.chatSplitter)
 		}))
-		children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		rowChildren = append(rowChildren, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			gtx.Constraints.Min.X = state.workspace.chatWidth
 			gtx.Constraints.Max.X = state.workspace.chatWidth
 			return layoutChatPanel(gtx, th, state)
 		}))
 	}
 
-	return layout.Flex{Axis: layout.Horizontal}.Layout(gtx, children...)
+	rowChildren = append(rowChildren, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		gtx.Constraints.Min.X = activityWidth
+		gtx.Constraints.Max.X = activityWidth
+		return layoutActivityBar(gtx, th, []activityBarItem{
+			{Button: &state.workspace.chatButton, Active: state.workspace.chatVisible, Label: "C"},
+		})
+	}))
+
+	mainRow := func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Horizontal}.Layout(gtx, rowChildren...)
+	}
+
+	if !state.workspace.terminal.visible {
+		return mainRow(gtx)
+	}
+
+	topHeight := gtx.Constraints.Max.Y - splitterWidth - state.workspace.terminal.height
+	if topHeight < minMainHeightPx {
+		topHeight = minMainHeightPx
+	}
+
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints.Min.Y = topHeight
+			gtx.Constraints.Max.Y = topHeight
+			return mainRow(gtx)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layoutHorizontalSplitter(gtx, &state.workspace.terminal.splitter)
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints.Min.Y = state.workspace.terminal.height
+			gtx.Constraints.Max.Y = state.workspace.terminal.height
+			return layoutTerminalPanel(gtx, th, state)
+		}),
+	)
 }
 
-func layoutActivityBar(gtx layout.Context, th *material.Theme, state *ideState) layout.Dimensions {
-	return widget.Border{
-		Color:        color.NRGBA{R: 0xD0, G: 0xD7, B: 0xDE, A: 0xFF},
-		CornerRadius: unit.Dp(10),
-		Width:        unit.Dp(1),
-	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		fill(gtx, color.NRGBA{R: 0xF2, G: 0xEC, B: 0xE2, A: 0xFF})
-		return layout.UniformInset(unit.Dp(6)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return layoutActivityButton(gtx, th, &state.workspace.explorerButton, state.workspace.explorerVisible, "E")
-				}),
-				layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					return layoutActivityButton(gtx, th, &state.workspace.chatButton, state.workspace.chatVisible, "C")
-				}),
-			)
-		})
+type activityBarItem struct {
+	Button *widget.Clickable
+	Active bool
+	Label  string
+}
+
+func layoutActivityBar(gtx layout.Context, th *material.Theme, items []activityBarItem) layout.Dimensions {
+	fill(gtx, color.NRGBA{R: 0xF2, G: 0xEC, B: 0xE2, A: 0xFF})
+	return layout.UniformInset(unit.Dp(6)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			children := make([]layout.FlexChild, 0, len(items)*2)
+			for i := range items {
+				item := items[i]
+				children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layoutActivityButton(gtx, th, item.Button, item.Active, item.Label)
+				}))
+				if i < len(items)-1 {
+					children = append(children, layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout))
+				}
+			}
+			children = append(children, layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				return layout.Dimensions{}
+			}))
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
 	})
 }
 
@@ -282,13 +412,35 @@ func layoutPaneSplitter(gtx layout.Context, splitter *paneSplitter) layout.Dimen
 	)
 }
 
+func layoutHorizontalSplitter(gtx layout.Context, splitter *verticalPaneSplitter) layout.Dimensions {
+	height := gtx.Dp(unit.Dp(splitterWidthDp))
+	gtx.Constraints.Min.Y = height
+	gtx.Constraints.Max.Y = height
+	defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
+	pointer.CursorRowResize.Add(gtx.Ops)
+	splitter.drag.Add(gtx.Ops)
+	return layout.Stack{}.Layout(gtx,
+		layout.Expanded(func(gtx layout.Context) layout.Dimensions {
+			fill(gtx, color.NRGBA{R: 0xEE, G: 0xE7, B: 0xDA, A: 0xFF})
+			return layout.Dimensions{Size: gtx.Constraints.Min}
+		}),
+		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
+			return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				lineH := max(2, height/3)
+				gtx.Constraints.Min = image.Pt(gtx.Constraints.Max.X-12, lineH)
+				gtx.Constraints.Max = gtx.Constraints.Min
+				fill(gtx, color.NRGBA{R: 0xD0, G: 0xC6, B: 0xB6, A: 0xFF})
+				return layout.Dimensions{Size: gtx.Constraints.Min}
+			})
+		}),
+	)
+}
+
 func layoutChatPanel(gtx layout.Context, th *material.Theme, state *ideState) layout.Dimensions {
-	return widget.Border{
-		Color:        color.NRGBA{R: 0xD0, G: 0xD7, B: 0xDE, A: 0xFF},
-		CornerRadius: unit.Dp(10),
-		Width:        unit.Dp(1),
-	}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		fill(gtx, color.NRGBA{R: 0xFB, G: 0xF8, B: 0xF2, A: 0xFF})
+	return layoutWithSideBorders(gtx,
+		color.NRGBA{R: 0xFB, G: 0xF8, B: 0xF2, A: 0xFF},
+		color.NRGBA{R: 0xD0, G: 0xD7, B: 0xDE, A: 0xFF},
+		func(gtx layout.Context) layout.Dimensions {
 		return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -352,7 +504,7 @@ func layoutStatusBar(gtx layout.Context, th *material.Theme, state *ideState) la
 	fill(gtx, color.NRGBA{R: 0xF0, G: 0xEA, B: 0xDE, A: 0xFF})
 	fillRect(gtx, image.Rect(0, 0, gtx.Constraints.Max.X, 1), color.NRGBA{R: 0xD9, G: 0xD2, B: 0xC7, A: 0xFF})
 
-	left := "Project: " + folderDisplayName(state.currentDir)
+	left := "Project: " + state.currentDir
 	center := "File: " + state.selectedFileLabel()
 	right := fmt.Sprintf("Explorer %dpx | Chat %dpx", state.workspace.explorerWidth, state.workspace.chatWidth)
 	return layout.Inset{
